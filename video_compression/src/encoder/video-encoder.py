@@ -1,3 +1,4 @@
+from enum import Enum
 import cv2
 import numpy as np
 from scipy.fftpack import dct, idct
@@ -10,6 +11,10 @@ from dataclasses import dataclass
 import logging
 from multiprocessing import Pool, cpu_count
 import os
+class BlockType(Enum):
+    BACKGROUND = 0
+    FOREGROUND = 1
+
 @dataclass
 class MotionVector:
     """Represents a motion vector with its position and direction."""
@@ -18,7 +23,26 @@ class MotionVector:
     dx: int  # Motion in x direction
     dy: int  # Motion in y direction
     mad: float  # Mean absolute difference
-
+class FrameBuffer:
+    def __init__(self, buffer_size: int = 2):
+        self.buffer_size = buffer_size
+        self.frames = []
+        self.current_frame_idx = -1
+    
+    def add_frame(self, frame: np.ndarray):
+        if len(self.frames) >= self.buffer_size:
+            self.frames.pop(0)
+        self.frames.append(frame.copy())
+        self.current_frame_idx += 1
+    
+    def get_previous_frame(self) -> Optional[np.ndarray]:
+        if len(self.frames) < 2:
+            return None
+        return self.frames[-2]
+    
+    def clear(self):
+        self.frames.clear()
+        self.current_frame_idx = -1
 class VideoEncoder:
     def __init__(self, input_path: str):
         """Initialize video encoder with automatic resolution detection."""
@@ -30,7 +54,6 @@ class VideoEncoder:
         self._detect_dimensions(input_path)
         
         # Initialize parameters
-        self.prev_frame = None
         self.mb_rows = self.height // 16
         self.mb_cols = self.width // 16
         
@@ -38,11 +61,19 @@ class VideoEncoder:
         self.motion_threshold = 20.0
         self.search_range = 16
 
+        # Parallel processing setup
         self.use_multiprocessing = True
         self.num_processes = os.cpu_count()
+
+        # Initialize frame buffer
+        self.frame_buffer = FrameBuffer(buffer_size=2)
         
         self.logger.info(f"Initialized encoder: {self.width}x{self.height}, "
                         f"{self.mb_rows}x{self.mb_cols} macroblocks")
+    def _write_header(self, outfile: BinaryIO, n1: int, n2: int):
+        """写入压缩文件头部。"""
+        header = f"{n1} {n2}\n"
+        outfile.write(header.encode())
 
     def _detect_dimensions(self, input_path: str):
         """Detect video dimensions from file size."""
@@ -58,6 +89,7 @@ class VideoEncoder:
                 self.width = w
                 self.height = h
                 self.frame_size = frame_bytes
+                self.num_frames = file_size // frame_bytes
                 return
                 
         raise ValueError("Invalid video dimensions. Expected 960x540 or 1920x1080")
@@ -106,43 +138,123 @@ class VideoEncoder:
             block[target_y:target_y+h, target_x:target_x+w] = frame[y_start:y_end, x_start:x_end]
         
         return block
+    def _process_frame_chunk(self, args):
+        """Process a chunk of frame in parallel."""
+        frame_chunk, prev_frame_chunk, start_y, n1, n2 = args
+        chunk_height = frame_chunk.shape[0]
+        encoded_data = []
+        
+        # Process each block in the chunk
+        for y in range(0, chunk_height - 15, 16):  # 修改循环范围
+            for x in range(0, self.width - 15, 16):  # 修改循环范围
+                abs_y = start_y + y
+                
+                # 确保我们有完整的16x16块
+                if y + 16 > chunk_height or x + 16 > self.width:
+                    continue
+                    
+                # 获取当前块
+                curr_block = frame_chunk[y:y+16, x:x+16]
+                
+                # 获取对应的前一帧块
+                if prev_frame_chunk is not None:
+                    if y + 16 > prev_frame_chunk.shape[0] or x + 16 > prev_frame_chunk.shape[1]:
+                        continue
+                
+                # 计算运动向量
+                mv = self.calculate_motion_vector(curr_block, prev_frame_chunk, abs_y, x)
+                
+                # 确定是否为前景
+                motion_magnitude = np.sqrt(mv.dx**2 + mv.dy**2)
+                is_foreground = motion_magnitude > self.motion_threshold
+                
+                # 处理块
+                block_type, coeffs = self.process_macroblock(curr_block, is_foreground, n1, n2)
+                
+                # 格式化数据
+                block_data = f"{block_type} " + " ".join(map(str, coeffs)) + "\n"
+                encoded_data.append(block_data)
+        
+        return "".join(encoded_data).encode()
 
     def calculate_motion_vector(self, curr_block: np.ndarray, prev_frame: np.ndarray, 
                             block_y: int, block_x: int) -> MotionVector:
-        """Optimized motion vector calculation with larger step size."""
+        """改进的层级式运动估计算法。"""
         if prev_frame is None:
             return MotionVector(block_x, block_y, 0, 0, float('inf'))
         
-        # Convert to grayscale for motion estimation
-        curr_gray = cv2.cvtColor(curr_block, cv2.COLOR_RGB2GRAY)
+        # 确保当前块是16x16
+        if curr_block.shape[0] != 16 or curr_block.shape[1] != 16:
+            return MotionVector(block_x, block_y, 0, 0, float('inf'))
+            
+        # 转换为YUV空间并只使用Y分量
+        curr_y = cv2.cvtColor(curr_block, cv2.COLOR_RGB2YUV)[:,:,0]
         
         min_mad = float('inf')
         best_dx = best_dy = 0
         
-        # Reduce search range and increase step size
-        self.search_range = 8  # Reduced from 16
-        step_size = 4   # Increased from 2
+        # 三层搜索策略
+        search_patterns = [
+            (16, 8),  # 第一层：大范围粗搜索
+            (8, 4),   # 第二层：中等范围搜索
+            (4, 2)    # 第三层：精细搜索
+        ]
         
-        y_min = max(-self.search_range, -block_y)
-        y_max = min(self.search_range, self.height - block_y - 16)
-        x_min = max(-self.search_range, -block_x)
-        x_max = min(self.search_range, self.width - block_x - 16)
+        curr_dx = curr_dy = 0
+        for search_range, step in search_patterns:
+            y_min = max(-search_range + curr_dy, -block_y)
+            y_max = min(search_range + curr_dy, self.height - block_y - 16)
+            x_min = max(-search_range + curr_dx, -block_x)
+            x_max = min(search_range + curr_dx, self.width - block_x - 16)
+            
+            for dy in range(y_min, y_max + 1, step):
+                for dx in range(x_min, x_max + 1, step):
+                    ref_y = block_y + dy
+                    ref_x = block_x + dx
+                    
+                    if (0 <= ref_y < self.height-15 and 0 <= ref_x < self.width-15 and
+                        ref_y + 16 <= prev_frame.shape[0] and ref_x + 16 <= prev_frame.shape[1]):
+                        ref_block = prev_frame[ref_y:ref_y+16, ref_x:ref_x+16]
+                        if ref_block.shape[0] != 16 or ref_block.shape[1] != 16:
+                            continue
+                            
+                        ref_y = cv2.cvtColor(ref_block, cv2.COLOR_RGB2YUV)[:,:,0]
+                        
+                        # 使用SAD代替MAD加快计算
+                        sad = np.sum(np.abs(curr_y - ref_y))
+                        if sad < min_mad:
+                            min_mad = sad
+                            best_dx, best_dy = dx, dy
+                            curr_dx, curr_dy = dx, dy  # 更新搜索中心
         
-        for dy in range(y_min, y_max + 1, step_size):
-            for dx in range(x_min, x_max + 1, step_size):
-                ref_y = block_y + dy
-                ref_x = block_x + dx
-                
-                if 0 <= ref_y < self.height-15 and 0 <= ref_x < self.width-15:
-                    ref_block = prev_frame[ref_y:ref_y+16, ref_x:ref_x+16]
-                    ref_gray = cv2.cvtColor(ref_block, cv2.COLOR_RGB2GRAY)
-                    mad = np.sum(np.abs(curr_gray - ref_gray)) / 256  # 使用sum代替mean加快速度
-                    if mad < min_mad:
-                        min_mad = mad
-                        best_dx, best_dy = dx, dy
-        
-        return MotionVector(block_x, block_y, best_dx, best_dy, min_mad)
+        return MotionVector(block_x, block_y, best_dx, best_dy, min_mad / 256)
 
+    def encode_frame(self, frame: np.ndarray, n1: int, n2: int) -> bytes:
+        """Encode a single frame using parallel processing."""
+        if not hasattr(self, 'use_multiprocessing'):
+            return self._encode_frame_single(frame, n1, n2)
+        
+        chunks = []
+        chunk_size = ((self.height + self.num_processes - 1) // self.num_processes) // 16 * 16
+        prev_frame = self.frame_buffer.get_previous_frame()
+        
+        for i in range(0, self.height, chunk_size):
+            end_y = min(i + chunk_size, self.height)
+            # 确保块高度是16的倍数
+            if end_y - i < 16:
+                continue
+            chunks.append((
+                frame[i:end_y],
+                prev_frame[i:end_y] if prev_frame is not None else None,
+                i, n1, n2
+            ))
+        
+        # Process chunks in parallel
+        with Pool(self.num_processes) as pool:
+            results = pool.map(self._process_frame_chunk, chunks)
+        
+        # Combine results
+        return b''.join(results)
 # 在class VideoEncoder中添加以下方法：
 
     def _estimate_global_motion(self, vectors: List[MotionVector]) -> Tuple[float, float]:
@@ -186,24 +298,57 @@ class VideoEncoder:
             return angle <= angle_threshold
         
         return False
-
     def _is_background(self, mv: MotionVector, global_motion: Tuple[float, float]) -> bool:
-        """判断一个块是否属于背景。"""
+        """改进的背景检测算法。"""
         motion_magnitude = np.sqrt(mv.dx**2 + mv.dy**2)
         global_mag = np.sqrt(global_motion[0]**2 + global_motion[1]**2)
         
-        # 情况1：几乎没有运动
-        if motion_magnitude < 0.5 and global_mag < 0.5:
+        # 静止判断
+        if motion_magnitude < self.motion_threshold * 0.5:
             return True
         
-        # 情况2：运动与全局运动一致（摄像机运动）
+        # 摄像机运动判断
         if global_mag > 0:
-            dot_product = mv.dx * global_motion[0] + mv.dy * global_motion[1]
-            cos_angle = dot_product / (motion_magnitude * global_mag)
+            motion_direction = np.array([mv.dx, mv.dy]) / motion_magnitude
+            global_direction = np.array(global_motion) / global_mag
+            
+            # 计算方向相似度
+            direction_similarity = np.dot(motion_direction, global_direction)
+            
+            # 计算幅度相似度
             magnitude_ratio = min(motion_magnitude, global_mag) / max(motion_magnitude, global_mag)
-            return cos_angle > 0.95 and magnitude_ratio > 0.7
+            
+            return direction_similarity > 0.95 and magnitude_ratio > 0.7
         
         return False
+    def _encode_frame_parallel(self, frame: np.ndarray, n1: int, n2: int) -> bytes:
+        """改进的并行帧编码。"""
+        height_per_process = ((self.height + self.num_processes - 1) 
+                            // self.num_processes) // 16 * 16
+        
+        chunks = []
+        for i in range(0, self.height, height_per_process):
+            end = min(i + height_per_process, self.height)
+            chunks.append((
+                frame[i:end],
+                self.prev_frame[i:end] if self.prev_frame is not None else None,
+                i, n1, n2
+            ))
+        
+        with Pool(self.num_processes) as pool:
+            results = pool.map(self._process_frame_chunk, chunks)
+        
+        return b''.join(results)
+    def _write_frame_data(self, outfile: BinaryIO, block_type: int, coeffs: List[float]):
+        """规范化的文件写入。"""
+        data = [str(block_type)]
+        
+        # 按RGB通道分组写入系数
+        for i in range(0, len(coeffs), 64):
+            channel_coeffs = coeffs[i:i+64]
+            data.extend(map(str, channel_coeffs))
+        
+        outfile.write((' '.join(data) + '\n').encode())
 
     def _find_contiguous_region(self, start_idx: int, vectors: List[MotionVector], 
                             start_row: int, start_col: int) -> Set[int]:
@@ -295,67 +440,20 @@ class VideoEncoder:
         
         return (1 if is_foreground else 0), coeffs
 
-    def _process_frame_chunk(self, args):
-        """Process a chunk of frame in parallel."""
-        frame_chunk, start_y, n1, n2 = args
-        chunk_height = frame_chunk.shape[0]
-        encoded_data = []
-        
-        # Process each block in the chunk
-        for y in range(0, chunk_height, 16):
-            for x in range(0, self.width, 16):
-                abs_y = start_y + y  # Absolute y position in the full frame
-                
-                # Get current block
-                curr_block = frame_chunk[y:y+16, x:x+16]
-                if curr_block.shape[0] != 16 or curr_block.shape[1] != 16:
-                    continue
-                    
-                # Calculate motion vector
-                mv = self.calculate_motion_vector(curr_block, self.prev_frame, abs_y, x)
-                
-                # Determine if foreground (simplified for speed)
-                motion_magnitude = np.sqrt(mv.dx**2 + mv.dy**2)
-                is_foreground = motion_magnitude > self.motion_threshold
-                
-                # Process block
-                block_type, coeffs = self.process_macroblock(curr_block, is_foreground, n1, n2)
-                
-                # Format data
-                block_data = f"{block_type} " + " ".join(map(str, coeffs)) + "\n"
-                encoded_data.append(block_data)
-        
-        return "".join(encoded_data).encode()
 
-    def encode_frame(self, frame: np.ndarray, n1: int, n2: int) -> bytes:
-        """Encode a single frame using parallel processing."""
-        if not hasattr(self, 'use_multiprocessing'):
-            # 如果是第一帧或不想使用并行处理，使用原始方法
-            return self._encode_frame_single(frame, n1, n2)
-        
-        # Split frame into chunks for parallel processing
-        chunks = []
-        chunk_size = self.height // self.num_processes
-        for i in range(self.num_processes):
-            start_y = i * chunk_size
-            end_y = start_y + chunk_size if i < self.num_processes - 1 else self.height
-            chunks.append((frame[start_y:end_y], start_y, n1, n2))
-        
-        # Process chunks in parallel
-        with Pool(self.num_processes) as pool:
-            results = pool.map(self._process_frame_chunk, chunks)
-        
-        # Combine results
-        return b''.join(results)
+
+
 
     def _encode_frame_single(self, frame: np.ndarray, n1: int, n2: int) -> bytes:
         """Original single-threaded frame encoding method."""
         # Calculate motion vectors for all blocks
         motion_vectors = []
+        prev_frame = self.frame_buffer.get_previous_frame()
+        
         for y in range(0, self.height, 16):
             for x in range(0, self.width, 16):
                 curr_block = self.get_block(frame, y, x)
-                mv = self.calculate_motion_vector(curr_block, self.prev_frame, y, x)
+                mv = self.calculate_motion_vector(curr_block, prev_frame, y, x)
                 motion_vectors.append(mv)
         
         # Group blocks based on motion
@@ -382,42 +480,49 @@ class VideoEncoder:
             encoded_data.append(block_data)
         
         return "".join(encoded_data).encode()
-
     def encode_video(self, input_path: str, n1: int, n2: int):
-        """Encode the entire video file."""
+        self.logger.info(f"Starting encoding with parameters n1={n1}, n2={n2}")
         self.validate_parameters(n1, n2)
         output_path = str(Path(input_path).with_suffix('.cmp'))
+        temp_path = output_path + '.tmp'
         
         try:
-            with open(input_path, 'rb') as infile, open(output_path, 'wb') as outfile:
-                # Write header
-                outfile.write(f"{n1} {n2}\n".encode())
+            with open(input_path, 'rb') as infile, open(temp_path, 'wb') as outfile:
+                self._write_header(outfile, n1, n2)
                 
-                # Calculate total frames
-                total_frames = os.path.getsize(input_path) // self.frame_size
-                self.logger.info(f"Processing {total_frames} frames")
-                
-                # Process frames
-                with tqdm(total=total_frames, desc="Encoding frames") as pbar:
-                    while True:
-                        frame = self.read_frame(infile)
-                        if frame is None:
-                            break
-                        
-                        # Encode frame
-                        encoded_frame = self.encode_frame(frame, n1, n2)
-                        outfile.write(encoded_frame)
-                        
-                        # Update previous frame
-                        self.prev_frame = frame.copy()
-                        pbar.update(1)
-                
-                self.logger.info(f"Encoding completed: {output_path}")
-                
+                with tqdm(total=self.num_frames) as pbar:
+                    frame_count = 0
+                    while frame_count < self.num_frames:
+                        try:
+                            frame = self.read_frame(infile)
+                            if frame is None:
+                                break
+                                
+                            # 使用frame_buffer而不是直接更新prev_frame
+                            self.frame_buffer.add_frame(frame)
+                            
+                            encoded_frame = self.encode_frame(frame, n1, n2)
+                            outfile.write(encoded_frame)
+                            
+                            frame_count += 1
+                            pbar.update(1)
+                            
+                        except Exception as e:
+                            self.logger.error(f"Frame {frame_count} encoding failed: {e}")
+                            if frame_count == 0:
+                                raise
+                            continue
+            
+            os.replace(temp_path, output_path)
+            self.logger.info(f"Encoding completed: {output_path}")
+            
         except Exception as e:
             self.logger.error(f"Encoding failed: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
             raise
-
+        finally:
+            self.frame_buffer.clear()
 def main():
     parser = argparse.ArgumentParser(description='Video Encoder')
     parser.add_argument('input_video', help='Input RGB video file')
