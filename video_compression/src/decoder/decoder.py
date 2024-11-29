@@ -4,6 +4,8 @@ import tkinter as tk
 import pygame
 import threading
 import time
+import wave
+from PIL import Image, ImageTk
 
 
 class CMPDecoder:
@@ -47,7 +49,6 @@ class CMPDecoder:
                 for col in range(self.mb_cols):
                     block_info = file.readline().decode().strip().split()
                     if not block_info:
-                        # If macroblock data is missing, assume end of file and stop processing
                         raise EOFError("Unexpected end of file while reading macroblock data")
                     is_foreground = int(block_info[0]) == 1
                     coeffs = list(map(float, block_info[1:]))
@@ -60,7 +61,6 @@ class CMPDecoder:
         except Exception as e:
             print(f"[Decoder] Error while reading frame: {e}")
             raise
-
 
     def decode(self):
         with open(self.cmp_file, 'rb') as file:
@@ -87,96 +87,105 @@ class VideoPlayer:
         self.fps = fps
         self.playing = False
         self.current_frame = 0
-        self.width = 960    # Fixed width
-        self.height = 540   # Fixed height
+        self.width = 960
+        self.height = 540
         self.start_time = None
 
-        # Initialize audio using pygame
         pygame.mixer.init(frequency=44100)
         pygame.mixer.music.load(audio_path)
 
-        # Initialize the Tkinter GUI window
+        self.audio_duration = self.get_audio_duration(audio_path)
+        self.video_duration = len(self.frames) / self.fps
+        print(f"Audio Duration: {self.audio_duration:.2f} seconds")
+        print(f"Video Duration: {self.video_duration:.2f} seconds")
+
         self.root = tk.Tk()
         self.root.title("Video Player")
+        self.root.geometry(f"{self.width}x{self.height + 100}")
 
-        # Video display area
         self.video_label = tk.Label(self.root)
         self.video_label.pack()
 
-        # Control panel frame
+        first_frame = self.frames[0] if self.frames else np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        # frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(first_frame)
+        photo = ImageTk.PhotoImage(image=img)
+        self.video_label.config(image=photo)
+        self.video_label.image = photo
+
         self.control_frame = tk.Frame(self.root)
         self.control_frame.pack(fill=tk.X)
 
-        # Play/pause button
         self.play_button = tk.Button(
             self.control_frame, text="Play", command=self.toggle_playback
         )
         self.play_button.pack(side=tk.LEFT)
 
-        # Stop button
         self.stop_button = tk.Button(
             self.control_frame, text="Stop", command=self.stop_playback
         )
         self.stop_button.pack(side=tk.LEFT)
 
-        # Next frame button
         self.next_button = tk.Button(
             self.control_frame, text="Next", command=self.next_frame
         )
         self.next_button.pack(side=tk.LEFT)
 
-        # Frame number display
         self.frame_label = tk.Label(self.control_frame, text="Frame: 0")
         self.frame_label.pack(side=tk.RIGHT)
 
-        # Start the GUI event loop
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.mainloop()
 
+    def get_audio_duration(self, audio_path):
+        with wave.open(audio_path, 'rb') as audio_file:
+            frames = audio_file.getnframes()
+            rate = audio_file.getframerate()
+            duration = frames / float(rate)
+            return duration
+
     def toggle_playback(self):
         if self.playing:
-            # Pause playback
             self.playing = False
-            pygame.mixer.music.pause()  # Pause audio
+            pygame.mixer.music.pause()
             self.play_button.config(text="Play")
             print("[Player] Playback paused.")
         else:
-            # Resume playback
             self.playing = True
             if not pygame.mixer.music.get_busy():
                 pygame.mixer.music.play()
-                self.start_time = time.time() - self.current_frame / self.fps
+                self.start_time = time.perf_counter()
             else:
                 pygame.mixer.music.unpause()
-                self.start_time = time.time() - self.current_frame / self.fps
+                self.start_time = time.perf_counter() - self.current_frame / self.fps
             threading.Thread(target=self.play_video).start()
             self.play_button.config(text="Pause")
             print("[Player] Playback started.")
 
     def stop_playback(self):
         self.playing = False
-        pygame.mixer.music.stop()  # Stop audio playback
-        self.current_frame = 0    # Reset to the first frame
+        pygame.mixer.music.stop()
+        self.current_frame = 0
         self.update_frame()
         self.play_button.config(text="Play")
         print("[Player] Playback stopped.")
 
     def play_video(self):
+        frame_duration = 1 / self.fps
+        next_frame_time = time.perf_counter()
         while self.playing and self.current_frame < len(self.frames):
-            # Calculate expected frame display time
-            elapsed_time = time.time() - self.start_time
+            elapsed_time = time.perf_counter() - self.start_time
             expected_frame = int(elapsed_time * self.fps)
 
-            # Display the frame if it's time
             if self.current_frame <= expected_frame:
                 self.update_frame()
-                print(f"[Player] Playing frame {self.current_frame + 1}")
                 self.current_frame += 1
 
-            # Sleep for a small duration to avoid busy-waiting
-            time.sleep(0.001)
+            next_frame_time += frame_duration
+            sleep_time = next_frame_time - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
-        # Stop playback when video ends
         if self.current_frame >= len(self.frames):
             print("[Player] Video playback finished.")
             self.playing = False
@@ -186,24 +195,19 @@ class VideoPlayer:
         if self.current_frame + 1 < len(self.frames):
             self.current_frame += 1
             self.update_frame()
-            print(f"[Player] Jumped to frame {self.current_frame + 1}")
         else:
             print("[Player] No more frames to show.")
 
     def update_frame(self):
         if self.current_frame < len(self.frames):
             frame = self.frames[self.current_frame]
-            # Resize frame to match the fixed window size
-            frame_resized = cv2.resize(frame, (self.width, self.height))
-            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-
-            # Convert the frame to a format Tkinter can use
-            photo = tk.PhotoImage(data=cv2.imencode(".png", frame_rgb)[1].tobytes())
+            frame_resized = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            # frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_resized)
+            photo = ImageTk.PhotoImage(image=img)
             self.video_label.config(image=photo)
             self.video_label.image = photo
             self.frame_label.config(text=f"Frame: {self.current_frame + 1}")
-        else:
-            print("[Player] No frame to display.")
 
     def close(self):
         self.playing = False
@@ -215,7 +219,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) != 3:
-        print("Usage: python decoder.py input_video.cmp input_audio.wav")
+        print("Usage: python player.py input_video.cmp input_audio.wav")
         sys.exit(1)
 
     cmp_file = sys.argv[1]
