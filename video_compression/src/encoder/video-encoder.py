@@ -142,30 +142,40 @@ class VideoEncoder:
         """Process a chunk of frame in parallel."""
         frame_chunk, prev_frame_chunk, start_y, n1, n2 = args
         chunk_height = frame_chunk.shape[0]
-        encoded_data = bytearray()
+        encoded_data = []
         
         # Process each block in the chunk
-        for y in range(0, chunk_height - 15, 16):
-            for x in range(0, self.width - 15, 16):
+        for y in range(0, chunk_height - 15, 16):  # 修改循环范围
+            for x in range(0, self.width - 15, 16):  # 修改循环范围
                 abs_y = start_y + y
                 
-                # 获取并检查块
-                curr_block = frame_chunk[y:y+16, x:x+16]
-                if curr_block.shape[0] != 16 or curr_block.shape[1] != 16:
+                # 确保我们有完整的16x16块
+                if y + 16 > chunk_height or x + 16 > self.width:
                     continue
+                    
+                # 获取当前块
+                curr_block = frame_chunk[y:y+16, x:x+16]
+                
+                # 获取对应的前一帧块
+                if prev_frame_chunk is not None:
+                    if y + 16 > prev_frame_chunk.shape[0] or x + 16 > prev_frame_chunk.shape[1]:
+                        continue
                 
                 # 计算运动向量
                 mv = self.calculate_motion_vector(curr_block, prev_frame_chunk, abs_y, x)
-                is_foreground = mv.mad > self.motion_threshold
+                
+                # 确定是否为前景
+                motion_magnitude = np.sqrt(mv.dx**2 + mv.dy**2)
+                is_foreground = motion_magnitude > self.motion_threshold
                 
                 # 处理块
-                block_type, block_data = self.process_macroblock(curr_block, is_foreground, n1, n2)
+                block_type, coeffs = self.process_macroblock(curr_block, is_foreground, n1, n2)
                 
-                # 写入块类型(1字节)和压缩后的数据
-                encoded_data.append(block_type)
-                encoded_data.extend(block_data)
+                # 格式化数据
+                block_data = f"{block_type} " + " ".join(map(str, coeffs)) + "\n"
+                encoded_data.append(block_data)
         
-        return bytes(encoded_data)
+        return "".join(encoded_data).encode()
 
     def calculate_motion_vector(self, curr_block: np.ndarray, prev_frame: np.ndarray, 
                             block_y: int, block_x: int) -> MotionVector:
@@ -329,20 +339,16 @@ class VideoEncoder:
             results = pool.map(self._process_frame_chunk, chunks)
         
         return b''.join(results)
-    def _write_frame_data(self, outfile: BinaryIO, block_type: int, coeffs: bytes):
-        """二进制格式写入。"""
-        outfile.write(bytes([block_type]))  # 写入块类型
-        outfile.write(coeffs)  # 写入系数数据
-    # def _write_frame_data(self, outfile: BinaryIO, block_type: int, coeffs: List[float]):
-    #     """规范化的文件写入。"""
-    #     data = [str(block_type)]
+    def _write_frame_data(self, outfile: BinaryIO, block_type: int, coeffs: List[float]):
+        """规范化的文件写入。"""
+        data = [str(block_type)]
         
-    #     # 按RGB通道分组写入系数
-    #     for i in range(0, len(coeffs), 64):
-    #         channel_coeffs = coeffs[i:i+64]
-    #         data.extend(map(str, channel_coeffs))
+        # 按RGB通道分组写入系数
+        for i in range(0, len(coeffs), 64):
+            channel_coeffs = coeffs[i:i+64]
+            data.extend(map(str, channel_coeffs))
         
-    #     outfile.write((' '.join(data) + '\n').encode())
+        outfile.write((' '.join(data) + '\n').encode())
 
     def _find_contiguous_region(self, start_idx: int, vectors: List[MotionVector], 
                             start_row: int, start_col: int) -> Set[int]:
@@ -410,31 +416,18 @@ class VideoEncoder:
         return block_is_foreground  
 
     def apply_dct(self, block: np.ndarray) -> np.ndarray:
-        dct_block = dct(dct(block, axis=0, norm='ortho'), axis=1, norm='ortho')
-        # 保留低频系数，丢弃高频系数
-        dct_block[4:, :] = 0
-        dct_block[:, 4:] = 0
-        return dct_block
-    
-    def quantize(self, dct_block: np.ndarray, n: int) -> np.ndarray:
-        # 使用更强的量化表
-        qt = np.array([
-            [16, 11, 10, 16, 24, 40, 51, 61],
-            [12, 12, 14, 19, 26, 58, 60, 55],
-            [14, 13, 16, 24, 40, 57, 69, 56],
-            [14, 17, 22, 29, 51, 87, 80, 62],
-            [18, 22, 37, 56, 68, 109, 103, 77],
-            [24, 35, 55, 64, 81, 104, 113, 92],
-            [49, 64, 78, 87, 103, 121, 120, 101],
-            [72, 92, 95, 98, 112, 100, 103, 99]
-        ]) * (2 ** (n-4))  # 基于n调整量化强度
-        
-        return np.round(dct_block / qt)
+        """Apply 2D DCT to 8x8 block."""
+        return dct(dct(block, axis=0, norm='ortho'), axis=1, norm='ortho')
 
-    def process_macroblock(self, block: np.ndarray, is_foreground: bool, n1: int, n2: int) -> Tuple[int, bytes]:
-        """Process a 16x16 macroblock with direct coefficient encoding."""
+    def quantize(self, dct_block: np.ndarray, n: int) -> np.ndarray:
+        """Quantize DCT coefficients using uniform quantization with step size 2^n."""
+        step = 2 ** n
+        return np.round(dct_block / step)
+
+    def process_macroblock(self, block: np.ndarray, is_foreground: bool, n1: int, n2: int) -> Tuple[int, List[float]]:
+        """Process a 16x16 macroblock."""
         n = n1 if is_foreground else n2
-        encoded_data = bytearray()
+        coeffs = []
         
         # Process each 8x8 block
         for i in range(0, 16, 8):
@@ -443,13 +436,9 @@ class VideoEncoder:
                     block_8x8 = block[i:i+8, j:j+8, c].astype(float)
                     dct_block = self.apply_dct(block_8x8)
                     quant_block = self.quantize(dct_block, n)
-                    # 直接编码量化后的系数
-                    for coeff in quant_block.flatten():
-                        # 将系数转换为16位整数
-                        coeff_int = int(np.clip(coeff, -32768, 32767))
-                        encoded_data.extend(coeff_int.to_bytes(2, byteorder='big', signed=True))
+                    coeffs.extend(quant_block.flatten())
         
-        return (BlockType.FOREGROUND.value if is_foreground else BlockType.BACKGROUND.value), encoded_data
+        return (1 if is_foreground else 0), coeffs
 
 
 
@@ -471,7 +460,7 @@ class VideoEncoder:
         block_classifications = self.group_motion_vectors(motion_vectors)
         
         # Encode blocks
-        encoded_data = bytearray()
+        encoded_data = []
         for i, mv in enumerate(motion_vectors):
             # Get block position
             block_y = mv.y
@@ -484,13 +473,13 @@ class VideoEncoder:
             is_foreground = block_classifications.get(i, False)
             
             # Process block
-            block_type, block_data = self.process_macroblock(curr_block, is_foreground, n1, n2)
+            block_type, coeffs = self.process_macroblock(curr_block, is_foreground, n1, n2)
             
-            # 写入二进制数据
-            encoded_data.append(block_type)
-            encoded_data.extend(block_data)
+            # Format data
+            block_data = f"{block_type} " + " ".join(map(str, coeffs)) + "\n"
+            encoded_data.append(block_data)
         
-        return bytes(encoded_data)
+        return "".join(encoded_data).encode()
     def encode_video(self, input_path: str, n1: int, n2: int):
         self.logger.info(f"Starting encoding with parameters n1={n1}, n2={n2}")
         self.validate_parameters(n1, n2)
