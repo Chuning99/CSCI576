@@ -10,7 +10,6 @@ import os
 from dataclasses import dataclass
 import logging
 from multiprocessing import Pool, cpu_count
-import os
 class BlockType(Enum):
     BACKGROUND = 0
     FOREGROUND = 1
@@ -44,55 +43,116 @@ class FrameBuffer:
         self.frames.clear()
         self.current_frame_idx = -1
 class VideoEncoder:
-    def __init__(self, input_path: str):
-        """Initialize video encoder with automatic resolution detection."""
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-        
-        # Detect video dimensions
-        self._detect_dimensions(input_path)
-        
-        # Initialize parameters
-        self.mb_rows = self.height // 16
-        self.mb_cols = self.width // 16
-        
-        # Motion detection parameters
-        self.motion_threshold = 20.0
-        self.search_range = 16
+    def __init__(self, input_path: str, visualize: bool = False):
+            """Initialize video encoder with visualization option."""
+            # Setup logging
+            logging.basicConfig(level=logging.INFO)
+            self.logger = logging.getLogger(__name__)
+            
+            # Detect video dimensions
+            self._detect_dimensions(input_path)
+            
+            # Initialize parameters
+            self.mb_rows = self.height // 16
+            self.mb_cols = self.width // 16
+            
+            # Motion detection parameters
+            self.motion_threshold = 20.0
+            self.search_range = 16
 
-        # Parallel processing setup
-        self.use_multiprocessing = True
-        self.num_processes = os.cpu_count()
+            # Parallel processing setup
+            self.use_multiprocessing = True
+            self.num_processes = os.cpu_count()
 
-        # Initialize frame buffer
-        self.frame_buffer = FrameBuffer(buffer_size=2)
-        
-        self.logger.info(f"Initialized encoder: {self.width}x{self.height}, "
-                        f"{self.mb_rows}x{self.mb_cols} macroblocks")
+            # Initialize frame buffer
+            self.frame_buffer = FrameBuffer(buffer_size=2)
+            
+            # Visualization flag
+            self.visualize = visualize
+            if self.visualize:
+                os.makedirs("visualizations", exist_ok=True)
     def _write_header(self, outfile: BinaryIO, n1: int, n2: int):
         """写入压缩文件头部。"""
         header = f"{n1} {n2}\n"
         outfile.write(header.encode())
-
+    def save_last_frame_visualization(self, frame: np.ndarray, motion_vectors: List[MotionVector], 
+                                        block_classifications: Dict[int, bool]):
+            """Save visualization for the last frame."""
+            vis_frame = frame.copy()
+            
+            # Draw motion vectors
+            for mv in motion_vectors:
+                if mv is None:
+                    continue
+                    
+                # Calculate start and end points
+                start = (mv.x + 8, mv.y + 8)
+                end = (mv.x + 8 + mv.dx, mv.y + 8 + mv.dy)
+                
+                # Determine color based on classification
+                idx = mv.y // 16 * self.mb_cols + mv.x // 16
+                color = (0, 255, 0) if block_classifications.get(idx, False) else (0, 0, 255)
+                
+                # Only draw significant motion vectors
+                if abs(mv.dx) > 0.5 or abs(mv.dy) > 0.5:
+                    cv2.arrowedLine(vis_frame, start, end, color, 1, tipLength=0.3)
+            
+            # Save the visualization
+            save_path = os.path.join("visualizations", "last_frame.png")
+            cv2.imwrite(save_path, cv2.cvtColor(vis_frame, cv2.COLOR_RGB2BGR))
+            self.logger.info(f"Last frame visualization saved to {save_path}")
     def _detect_dimensions(self, input_path: str):
         """Detect video dimensions from file size."""
         file_size = os.path.getsize(input_path)
         
         resolutions = {
-            (960, 540): 960 * 540 * 3,
-            (1920, 1080): 1920 * 1080 * 3
+            (960, 540): 960 * 540 * 3,    # 540p
+            (1920, 1080): 1920 * 1080 * 3,  # 1080p
+            (640, 480): 640 * 480 * 3,      # 480p
+            (1280, 720): 1280 * 720 * 3,    # 720p
+            (480, 360): 480 * 360 * 3,      # 360p
+            (720, 480): 720 * 480 * 3       # 480p 
         }
         
+        # 打印文件信息
+        self.logger.info(f"Input file size: {file_size} bytes")
+        
+        # 找到最接近整数帧数的分辨率
+        best_resolution = None
+        best_difference = float('inf')
+        
         for (w, h), frame_bytes in resolutions.items():
-            if file_size % frame_bytes == 0:
-                self.width = w
-                self.height = h
-                self.frame_size = frame_bytes
-                self.num_frames = file_size // frame_bytes
-                return
+            if frame_bytes == 0:
+                continue
                 
-        raise ValueError("Invalid video dimensions. Expected 960x540 or 1920x1080")
+            frames = file_size / frame_bytes
+            # 检查帧数是否接近整数
+            difference = abs(frames - round(frames))
+            
+            if difference < best_difference:
+                best_difference = difference
+                best_resolution = (w, h, frame_bytes, round(frames))
+        
+        if best_difference < 0.2:  # 允许很小的误差
+            w, h, frame_bytes, frames = best_resolution
+            self.width = w
+            self.height = h
+            self.frame_size = frame_bytes
+            self.num_frames = frames
+            self.logger.info(f"Detected resolution: {w}x{h}, frames: {frames}")
+            return
+        
+        # 如果没找到匹配的分辨率，打印所有可能性
+        self.logger.error("Could not detect video dimensions. Available information:")
+        self.logger.error(f"File size: {file_size} bytes")
+        self.logger.error("\nPossible resolutions:")
+        
+        for (w, h), bytes_per_frame in resolutions.items():
+            if file_size >= bytes_per_frame:
+                frames = file_size / bytes_per_frame
+                self.logger.error(f"{w}x{h}: {frames:.2f} frames")
+        
+        raise ValueError(f"Could not determine video dimensions for file size: {file_size} bytes")
 
     def validate_parameters(self, n1: int, n2: int):
         """Validate quantization parameters."""
@@ -179,25 +239,24 @@ class VideoEncoder:
 
     def calculate_motion_vector(self, curr_block: np.ndarray, prev_frame: np.ndarray,
                             block_y: int, block_x: int) -> MotionVector:
-        """改进的层级式运动估计算法。"""
         if prev_frame is None:
             return MotionVector(block_x, block_y, 0, 0, float('inf'))
 
-        # 确保当前块是16x16
+    
         if curr_block.shape[0] != 16 or curr_block.shape[1] != 16:
             return MotionVector(block_x, block_y, 0, 0, float('inf'))
 
-        # 转换为YUV空间并只使用Y分量
+
         curr_y = cv2.cvtColor(curr_block, cv2.COLOR_RGB2YUV)[:,:,0]
 
         min_mad = float('inf')
         best_dx = best_dy = 0
 
-        # 三层搜索策略
+        
         search_patterns = [
-            (16, 8),  # 第一层：大范围粗搜索
-            (8, 4),   # 第二层：中等范围搜索
-            (4, 2)    # 第三层：精细搜索
+            (16, 8),  # first layer: coarse search
+            (8, 4),   # second layer: medium refinement
+            (4, 2)    # third layer: fine search
         ]
 
         curr_dx = curr_dy = 0
@@ -220,12 +279,12 @@ class VideoEncoder:
 
                         ref_y = cv2.cvtColor(ref_block, cv2.COLOR_RGB2YUV)[:,:,0]
 
-                        # 使用SAD代替MAD加快计算
+                        
                         sad = np.sum(np.abs(curr_y - ref_y))
                         if sad < min_mad:
                             min_mad = sad
                             best_dx, best_dy = dx, dy
-                            curr_dx, curr_dy = dx, dy  # 更新搜索中心
+                            curr_dx, curr_dy = dx, dy  
 
         return MotionVector(block_x, block_y, best_dx, best_dy, min_mad / 256)
 
@@ -249,21 +308,19 @@ class VideoEncoder:
                 i, n1, n2
             ))
 
-        # Process chunks in parallel
+        # Process chunks in parallel and combine results
         with Pool(self.num_processes) as pool:
             results = pool.map(self._process_frame_chunk, chunks)
-
-        # Combine results
+        
         return b''.join(results)
+
 # 在class VideoEncoder中添加以下方法：
 
     def _estimate_global_motion(self, vectors: List[MotionVector]) -> Tuple[float, float]:
-        """估计全局运动（摄像机运动）。"""
         motions = [(mv.dx, mv.dy) for mv in vectors]
         if not motions:
             return (0.0, 0.0)
 
-        # 使用中值以减少异常值影响
         median_dx = np.median([dx for dx, _ in motions])
         median_dy = np.median([dy for _, dy in motions])
         return median_dx, median_dy
@@ -299,23 +356,20 @@ class VideoEncoder:
 
         return False
     def _is_background(self, mv: MotionVector, global_motion: Tuple[float, float]) -> bool:
-        """改进的背景检测算法。"""
         motion_magnitude = np.sqrt(mv.dx**2 + mv.dy**2)
         global_mag = np.sqrt(global_motion[0]**2 + global_motion[1]**2)
 
-        # 静止判断
+        # Static block detection
         if motion_magnitude < self.motion_threshold * 0.5:
             return True
 
-        # 摄像机运动判断
+        # Camera motion comparison
         if global_mag > 0:
             motion_direction = np.array([mv.dx, mv.dy]) / motion_magnitude
             global_direction = np.array(global_motion) / global_mag
 
-            # 计算方向相似度
             direction_similarity = np.dot(motion_direction, global_direction)
 
-            # 计算幅度相似度
             magnitude_ratio = min(motion_magnitude, global_mag) / max(motion_magnitude, global_mag)
 
             return direction_similarity > 0.95 and magnitude_ratio > 0.7
@@ -386,7 +440,7 @@ class VideoEncoder:
 
         # 估计全局运动
         global_motion = self._estimate_global_motion(vectors)
-        print(f"Estimated global motion: dx={global_motion[0]:.2f}, dy={global_motion[1]:.2f}")
+        #print(f"Estimated global motion: dx={global_motion[0]:.2f}, dy={global_motion[1]:.2f}")
 
         # 处理每个块
         for i, mv in enumerate(vectors):
@@ -490,51 +544,83 @@ class VideoEncoder:
             with open(input_path, 'rb') as infile, open(temp_path, 'wb') as outfile:
                 self._write_header(outfile, n1, n2)
                 
-                with tqdm(total=self.num_frames) as pbar:
-                    frame_count = 0
-                    while frame_count < self.num_frames:
+                # 预读取所有帧以确定总数
+                file_position = infile.tell()  # 记住当前文件位置
+                frame_count = 0
+                while self.read_frame(infile) is not None:
+                    frame_count += 1
+                infile.seek(file_position)  # 回到开始位置
+                
+                with tqdm(total=frame_count) as pbar:
+                    current_frame_number = 0
+                    last_frame = None
+                    
+                    while current_frame_number < frame_count:
                         try:
                             frame = self.read_frame(infile)
                             if frame is None:
                                 break
                                 
-                            # 使用frame_buffer而不是直接更新prev_frame
                             self.frame_buffer.add_frame(frame)
                             
+                            # 正常编码过程
                             encoded_frame = self.encode_frame(frame, n1, n2)
                             outfile.write(encoded_frame)
                             
-                            frame_count += 1
+                            # 只在最后一帧时处理可视化
+                            if self.visualize and current_frame_number == frame_count - 1:
+                                prev_frame = self.frame_buffer.get_previous_frame()
+                                motion_vectors = [
+                                    self.calculate_motion_vector(
+                                        self.get_block(frame, y, x),
+                                        prev_frame,
+                                        y, x
+                                    )
+                                    for y in range(0, self.height, 16)
+                                    for x in range(0, self.width, 16)
+                                ]
+                                block_classifications = self.group_motion_vectors(motion_vectors)
+                                self.save_last_frame_visualization(
+                                    frame,
+                                    motion_vectors,
+                                    block_classifications
+                                )
+                            
+                            current_frame_number += 1
                             pbar.update(1)
                             
                         except Exception as e:
-                            self.logger.error(f"Frame {frame_count} encoding failed: {e}")
-                            if frame_count == 0:
+                            self.logger.error(f"Frame {current_frame_number} encoding failed: {e}")
+                            if current_frame_number == 0:
                                 raise
                             continue
-            
-            os.replace(temp_path, output_path)
-            self.logger.info(f"Encoding completed: {output_path}")
-            
+                
+                os.replace(temp_path, output_path)
+                self.logger.info(f"Encoding completed: {output_path}")
+                
         except Exception as e:
             self.logger.error(f"Encoding failed: {e}")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise
+            
         finally:
             self.frame_buffer.clear()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Video Encoder')
     parser.add_argument('input_video', help='Input RGB video file')
     parser.add_argument('n1', type=int, help='Quantization step for foreground (1-8)')
     parser.add_argument('n2', type=int, help='Quantization step for background (1-8)')
-    
+    parser.add_argument('--visualize', action='store_true', help='Enable visualization')
+
     args = parser.parse_args()
     
     if not Path(args.input_video).exists():
         raise FileNotFoundError(f"Input file not found: {args.input_video}")
     
-    encoder = VideoEncoder(args.input_video)
+    encoder = VideoEncoder(args.input_video, visualize=args.visualize)
     encoder.encode_video(args.input_video, args.n1, args.n2)
 
 if __name__ == "__main__":
