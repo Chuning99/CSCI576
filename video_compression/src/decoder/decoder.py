@@ -90,6 +90,7 @@ class VideoPlayer:
         self.width = 960
         self.height = 540
         self.start_time = None
+        self.audio_playback_time = 0.0
 
         pygame.mixer.init(frequency=44100)
         pygame.mixer.music.load(audio_path)
@@ -147,17 +148,25 @@ class VideoPlayer:
     def toggle_playback(self):
         if self.playing:
             self.playing = False
+            self.audio_playback_time = pygame.mixer.music.get_pos() / 1000.0
+            print(self.audio_playback_time)
             pygame.mixer.music.pause()
             self.play_button.config(text="Play")
             print("[Player] Playback paused.")
         else:
             self.playing = True
             if not pygame.mixer.music.get_busy():
-                pygame.mixer.music.play()
-                self.start_time = time.perf_counter()
-            else:
-                pygame.mixer.music.unpause()
+                pygame.mixer.music.play(start=self.audio_playback_time)
+                # pygame.mixer.music.set_pos(self.audio_playback_time * 1000.0)
                 self.start_time = time.perf_counter() - self.current_frame / self.fps
+                print("not busy")
+            else:
+                pygame.mixer.music.play(start=self.audio_playback_time)
+                # pygame.mixer.music.set_pos(self.audio_playback_time)
+                self.start_time = time.perf_counter() - self.current_frame / self.fps
+                print(self.audio_playback_time)
+                print("busy")
+            # threading.Thread(target=self.play_video).start()
             threading.Thread(target=self.play_video).start()
             self.play_button.config(text="Pause")
             print("[Player] Playback started.")
@@ -166,6 +175,7 @@ class VideoPlayer:
         self.playing = False
         pygame.mixer.music.stop()
         self.current_frame = 0
+        self.audio_playback_time = 0.0
         self.update_frame()
         self.play_button.config(text="Play")
         print("[Player] Playback stopped.")
@@ -181,6 +191,12 @@ class VideoPlayer:
                 self.update_frame()
                 self.current_frame += 1
 
+            # audio_time = pygame.mixer.music.get_pos() / 1000.0
+            # video_time = self.current_frame / self.fps
+            # if abs(audio_time - video_time) > 0.1:
+            #     print(f"[Sync] Adjusting audio to match video: audio={audio_time:.2f}, video={video_time:.2f}")
+            #     pygame.mixer.music.set_pos(video_time)
+
             next_frame_time += frame_duration
             sleep_time = next_frame_time - time.perf_counter()
             if sleep_time > 0:
@@ -195,6 +211,8 @@ class VideoPlayer:
         if self.current_frame + 1 < len(self.frames):
             self.current_frame += 1
             self.update_frame()
+            self.audio_playback_time = self.current_frame / self.fps
+            pygame.mixer.music.set_pos(self.audio_playback_time)
         else:
             print("[Player] No more frames to show.")
 
