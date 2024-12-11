@@ -148,7 +148,7 @@ class VideoPlayer:
     def toggle_playback(self):
         if self.playing:
             self.playing = False
-            self.audio_playback_time = pygame.mixer.music.get_pos() / 1000.0
+            self.audio_playback_time = self.current_frame / self.fps
             print(self.audio_playback_time)
             pygame.mixer.music.pause()
             self.play_button.config(text="Play")
